@@ -90,6 +90,26 @@ def main():
           ["3535972005968872591", "1111222233334444555"])
     check("_candidate_ids 无返回时为空", m._candidate_ids({}), [])
 
+    # ---------- top_ids_from_preview：条目自身 id 的取法 ----------
+    # 目录条目只有 cid（自身 id）；文件条目有 fid（自身 id），其 cid 是父目录 id。
+    # 不传 file_id → 115 报 [990002] 参数错误（实测）。且必须是字符串。
+    d = {"list": [
+        {"cid": "3530276640787531285", "n": "目录条目"},                       # 无 fid → cid
+        {"fid": "3535341944643257441", "cid": 3530276654838449867, "n": "文件条目"},  # fid 优先
+        {"n": "两个都没有"},
+    ]}
+    check("top_ids_from_preview：目录取 cid、文件取 fid、且为字符串",
+          m.top_ids_from_preview(d),
+          ["3530276640787531285", "3535341944643257441"])
+    check("top_ids_from_preview 空 data", m.top_ids_from_preview({}), [])
+
+    # ---------- _collect_str_values：递归取 receive_title（层级不定）----------
+    rc2 = {"data": {"data": {"receive_title": "某剧 S01E01.mkv", "receive_size": 1},
+                    "receive_title": ""}}
+    check("_collect_str_values 递归取非空字符串",
+          m._collect_str_values(rc2, "receive_title"), ["某剧 S01E01.mkv"])
+    check("_collect_str_values 无该键", m._collect_str_values({}, "x"), [])
+
     print("-" * 40)
     if FAILED:
         print("FAILED: %d 项 -> %s" % (len(FAILED), ", ".join(FAILED)))

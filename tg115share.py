@@ -227,6 +227,47 @@ class TG(object):
 FID_RE = re.compile(r"^\d{15,20}$")
 
 
+def top_ids_from_preview(d):
+    """从 preview_share 的 data 里取出分享顶层条目**自身的** file_id。
+
+    115 分享列表的字段有讲究（实测）：
+      * 目录条目：只有 cid（= 目录自身 id），没有 fid
+      * 文件条目：有 fid（= 文件自身 id），而它的 cid 是**父目录 id**
+    所以「条目自身的 id」= fid 优先、缺省回退 cid，并且必须是**字符串**
+    （MCP 侧对 file_id 做 str 校验，传 int 会直接 ValidationError）。
+
+    receive_share 的 file_id 参数要的正是这个值；不传 → 115 报 [990002] 参数错误。
+    """
+    out = []
+    for it in (d.get("list") or []):
+        v = it.get("fid") or it.get("cid")
+        if v:
+            out.append(str(v))
+    return out
+
+
+def _collect_str_values(o, key):
+    """递归收集 JSON 里所有名为 key 的非空字符串值。
+
+    115 的返回层级不定（实测 receive_title 在 data.data 下），所以不写死路径。
+    """
+    out = []
+
+    def walk(x):
+        if isinstance(x, dict):
+            for k, v in x.items():
+                if k == key and isinstance(v, str) and v:
+                    out.append(v)
+                else:
+                    walk(v)
+        elif isinstance(x, list):
+            for y in x:
+                walk(y)
+
+    walk(o)
+    return out
+
+
 def _candidate_ids(rc):
     """从 receive_share 返回体里挖出疑似新建项的 file_id。
 
@@ -267,12 +308,17 @@ def account_guard(mcp, cfg):
 
 
 def do_preview(mcp, share_code, receive_code):
+    # limit 取满：顶层条目的 file_id 要**全部**拿到，转存时必须带上（见 run_pipeline）
     p = mcp.call("preview_share", share_code=share_code, receive_code=receive_code,
-                 cid="0", limit=20, offset=0)
+                 cid="0", limit=1000, offset=0)
     d = p.get("data") or {}
     info = d.get("shareinfo") or {}
     if not info:
         return None, "无法读取该分享（分享码或提取码可能不对）。"
+    total = d.get("count") or 0
+    if total and len(d.get("list") or []) < total:
+        logging.warning("分享顶层条目 %d 项 > 单页 %d 条，转存 file_id 可能取不全",
+                        total, len(d.get("list") or []))
     items = (d.get("list") or [])[:8]
     names = "\n".join("  · %s" % (it.get("n") or "") for it in items)
     txt = (
@@ -288,11 +334,14 @@ def do_preview(mcp, share_code, receive_code):
             "title": info.get("share_title") or "",
             "size": info.get("file_size") or 0,
             # 分享顶层的条目名 —— 转存后用它兜底匹配新目录
-            "top_names": [it.get("n") or "" for it in (d.get("list") or [])]}, txt
+            "top_names": [it.get("n") or "" for it in (d.get("list") or [])],
+            # 顶层条目的 file_id（115 字段名是 cid）—— receive_share 必须带，
+            # 否则 115 后端返回 [990002] 参数错误
+            "top_ids": top_ids_from_preview(d)}, txt
 
 
 def run_pipeline(tg, mcp, cfg, chat_id, share_code, receive_code, reply_msg_id,
-                 expect_names=None):
+                 expect_names=None, top_ids=None):
     bh = cfg["behavior"]
     throttle = float(bh.get("throttle_sec") or 1.5)
 
@@ -316,16 +365,28 @@ def run_pipeline(tg, mcp, cfg, chat_id, share_code, receive_code, reply_msg_id,
         before_ids = {f.get("file_id") for f in ((before.get("data") or {}).get("files") or [])}
 
         status("开始转存…")
-        rc = mcp.call("receive_share", share_code=share_code, receive_code=receive_code, cid=cid)
+        # 115 的 share/receive 要求**显式给出要转存的条目 id**：不传 file_id 时
+        # MCP 文档虽说"不传则转存全部"，但 115 后端会直接报 [990002] 参数错误。
+        # file_id 的取值 = preview_share 里顶层条目的 cid。
+        rargs = {"share_code": share_code, "receive_code": receive_code, "cid": cid}
+        if top_ids:
+            rargs["file_id"] = ",".join(str(x) for x in top_ids)
+        else:
+            logging.warning("[%s] 预览未拿到顶层 file_id，仍尝试不带 file_id 转存", chat_id)
+        rc = mcp.call("receive_share", **rargs)
         # 转存接口的原始返回必须留档 —— 失败时这是唯一线索
         logging.info("[%s] receive_share 返回: %s", chat_id,
                      json.dumps(rc, ensure_ascii=False)[:1500])
-        if rc.get("state") is False:
-            reason = (rc.get("error") or rc.get("errmsg") or rc.get("message")
-                      or json.dumps(rc, ensure_ascii=False)[:300])
-            status("⚠️ 转存被 115 拒绝：%s" % reason)
+        # 注意：失败返回形如 {"error": "[990002] 参数错误。"}，**没有 state 字段**，
+        # 所以不能只判 state is False，必须把顶层 error/msg 一并当失败。
+        err = rc.get("error") or rc.get("errmsg") or rc.get("message")
+        if err or rc.get("state") is False:
+            status("⚠️ 转存被 115 拒绝：%s"
+                   % (err or json.dumps(rc, ensure_ascii=False)[:300]))
             return
-        title = ((rc.get("data") or {}).get("receive_title") or "").strip()
+        # 115 返回里 receive_title 藏在多层嵌套下（实测在 data.data 里），递归找
+        recv_titles = _collect_str_values(rc, "receive_title")
+        title = (recv_titles[0] if recv_titles else "").strip()
         time.sleep(throttle)
 
         # 2) 轮询定位新目录
@@ -353,7 +414,7 @@ def run_pipeline(tg, mcp, cfg, chat_id, share_code, receive_code, reply_msg_id,
                     fid = c
                     break
             if not fid:                              # (b)(c)
-                wants = [w for w in ([title] + list(expect_names or [])) if w]
+                wants = [w for w in (recv_titles + [title] + list(expect_names or [])) if w]
                 for w in wants:
                     hit = next((f for f in new_items if f.get("name") == w), None)
                     if hit:
@@ -538,7 +599,7 @@ def main():
                         busy.add(chat_id)
                     threading.Thread(
                         target=lambda: (run_pipeline(tg, mcp, cfg, chat_id, code, pwd, msg_id,
-                                                     info.get("top_names")),
+                                                     info.get("top_names"), info.get("top_ids")),
                                         busy.discard(chat_id)),
                         daemon=True).start()
                     pending.pop(chat_id, None)
