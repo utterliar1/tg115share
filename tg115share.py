@@ -341,7 +341,7 @@ def do_preview(mcp, share_code, receive_code):
 
 
 def run_pipeline(tg, mcp, cfg, chat_id, share_code, receive_code, reply_msg_id,
-                 expect_names=None, top_ids=None):
+                 expect_names=None, top_ids=None, expect_size=None):
     bh = cfg["behavior"]
     throttle = float(bh.get("throttle_sec") or 1.5)
 
@@ -441,16 +441,27 @@ def run_pipeline(tg, mcp, cfg, chat_id, share_code, receive_code, reply_msg_id,
         if bh.get("share_duration_days"):
             kwargs["share_duration"] = int(bh["share_duration_days"])
         sh = mcp.call("share_files", **kwargs)
-        sd = sh.get("data") or {}
-        new_code, new_pwd = sd.get("share_code"), sd.get("receive_code")
-        url = sd.get("share_url") or ("https://115cdn.com/s/%s" % new_code)
+        logging.info("[%s] share_files 返回: %s", chat_id,
+                     json.dumps(sh, ensure_ascii=False)[:1500])
+        # 【踩坑】share_files 的返回**同样是多层嵌套**：share_code / receive_code /
+        # share_url 实测都在 data.data 下。写死 sh["data"]["share_code"] 会读不到，
+        # 于是分享**明明建成了却报「创建分享失败」**，副本也不会被删。
+        # 教训：115lite 的返回层级别猜，一律递归取值（同 receive_share 的 receive_title）。
+        codes = _collect_str_values(sh, "share_code")
+        pwds = _collect_str_values(sh, "receive_code")
+        urls = _collect_str_values(sh, "share_url")
+        new_code = codes[0] if codes else None
+        new_pwd = pwds[0] if pwds else ""
+        url = urls[0] if urls else ("https://115cdn.com/s/%s" % new_code)
         if not new_code:
-            status("⚠️ 创建分享失败：%s" % json.dumps(sh, ensure_ascii=False)[:300])
+            err = sh.get("error") or sh.get("errmsg") or sh.get("message")
+            status("⚠️ 创建分享失败：%s"
+                   % (err or json.dumps(sh, ensure_ascii=False)[:300]))
             return
 
         status("✅ 分享已创建（平台审核中）\n\n%s\n提取码：%s\n\n"
                "标题：%s\n体积：%s\n\n审核通过后会自动删除小号副本，请稍候…"
-               % (url, new_pwd, title or "-", fmt_size(sd.get("total_size"))))
+               % (url, new_pwd, title or "-", fmt_size(expect_size)))
 
         # 4) 轮询直到有效
         deadline = time.time() + float(bh.get("verify_timeout_hours") or 26) * 3600
@@ -489,7 +500,7 @@ def run_pipeline(tg, mcp, cfg, chat_id, share_code, receive_code, reply_msg_id,
                 return
             status("✅ 全部完成\n\n分享：%s\n提取码：%s\n标题：%s\n体积：%s\n\n"
                    "分享已确认有效，小号副本已删除（回收站可恢复）。"
-                   % (url, new_pwd, title or "-", fmt_size(sd.get("total_size"))))
+                   % (url, new_pwd, title or "-", fmt_size(expect_size)))
         else:
             status("✅ 分享已确认有效\n%s\n提取码：%s" % (url, new_pwd))
 
@@ -599,7 +610,8 @@ def main():
                         busy.add(chat_id)
                     threading.Thread(
                         target=lambda: (run_pipeline(tg, mcp, cfg, chat_id, code, pwd, msg_id,
-                                                     info.get("top_names"), info.get("top_ids")),
+                                                     info.get("top_names"), info.get("top_ids"),
+                                                     info.get("size")),
                                         busy.discard(chat_id)),
                         daemon=True).start()
                     pending.pop(chat_id, None)

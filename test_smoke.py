@@ -110,6 +110,17 @@ def main():
           m._collect_str_values(rc2, "receive_title"), ["某剧 S01E01.mkv"])
     check("_collect_str_values 无该键", m._collect_str_values({}, "x"), [])
 
+    # share_files 的返回同样多层嵌套（实测 share_code 在 data.data 下）；
+    # 写死顶层路径会读不到 → 分享已建成却误报「创建分享失败」。
+    sf = {"state": True, "data": {"state": True, "error": "", "errno": 0,
+                                  "data": {"share_code": "sws9nfe3wn7",
+                                           "receive_code": "dbe8",
+                                           "share_url": "https://115cdn.com/s/sws9nfe3wn7"}}}
+    check("嵌套 data.data 里的 share_code 能取出",
+          m._collect_str_values(sf, "share_code"), ["sws9nfe3wn7"])
+    check("嵌套 data.data 里的 receive_code 能取出",
+          m._collect_str_values(sf, "receive_code"), ["dbe8"])
+
     print("-" * 40)
     if FAILED:
         print("FAILED: %d 项 -> %s" % (len(FAILED), ", ".join(FAILED)))
