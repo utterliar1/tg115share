@@ -96,6 +96,21 @@ def parse_share(text):
     return code, (p.group(1) if p else "")
 
 
+def sse_data_text(raw):
+    """从 SSE 原始响应里取出 `data:` 之后的 JSON 文本。
+
+    MCP 走 text/event-stream 且**不带 charset**；requests 对这类 text/* 会把
+    `r.text` 默认按 ISO-8859-1 解码 → 中文全变乱码（如 "我誓言"→"æèªè¨"）。
+    因此这里只接受**原始字节**，强制按 UTF-8 解码后再取 data: 段。
+    """
+    if isinstance(raw, (bytes, bytearray)):
+        body = bytes(raw).decode("utf-8", "replace")
+    else:
+        body = raw
+    i = body.find("data:")
+    return body[i + 5:].strip() if i >= 0 else ""
+
+
 # --------------------------------------------------------------------------- #
 # MCP 客户端（HTTP 流式 / JSON-RPC）
 # --------------------------------------------------------------------------- #
@@ -127,11 +142,9 @@ class MCP(object):
             sid = r.headers.get("mcp-session-id") or r.headers.get("Mcp-Session-Id")
             if sid:
                 self.s.headers["Mcp-Session-Id"] = sid
-            # 响应是 SSE，且 JSON 内含裸换行 → 必须取 data: 之后整段解析
-            i = r.text.find("data:")
-            if i < 0:
-                return {}
-            return json.loads(r.text[i + 5:].strip())
+            # 必须用原始字节 → UTF-8（见 sse_data_text 的说明，别用 r.text）
+            text = sse_data_text(r.content)
+            return json.loads(text) if text else {}
 
     def _init_session(self):
         self._rpc("initialize", {

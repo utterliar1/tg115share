@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""离线回归测试 —— 只测不依赖网络的纯函数（链接解析 / 体积格式化）。
+"""离线回归测试 —— 只测不依赖网络的纯函数（链接解析 / 体积格式化 / SSE 解码）。
 
 CI 与本地同一口径：python test_smoke.py
 （不触碰 MCP 与 TG，因此可在任何环境无凭据运行。）
@@ -59,6 +59,25 @@ def main():
     check("fmt_size 46.45GiB",
           m.fmt_size(int(46.45 * 1024 ** 3)), "46.45 GB")
     check("fmt_size None", m.fmt_size(None), "0 B")
+
+    # ---------- sse_data_text：MCP 的 SSE 响应必须按 UTF-8 解 ----------
+    # 真实形态：Content-Type: text/event-stream（无 charset），JSON 内含中文。
+    sse = (
+        "event: message\r\n"
+        "data: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"content\":[{\"type\":\"text\","
+        "\"text\":\"{\\n  \\\"state\\\": true,\\n  \\\"data\\\": {\\n    \\\"user\\\": {\\n"
+        "      \\\"user_name\\\": \\\"我誓言\\\"\\n    }\\n  }\\n}\"}]}}\r\n\r\n"
+    ).encode("utf-8")
+
+    got = m.sse_data_text(sse)
+    check("sse_data_text 取到 data 段", got.startswith('{"jsonrpc"'), True)
+    check("sse_data_text 中文完好", ("我誓言" in got), True)
+
+    # 反向对照：旧 bug 是拿 r.text（latin-1）解，同样的字节会变乱码。
+    # 这条断言把「中文必须能原样读出」钉死在回归里。
+    bad = sse.decode("latin-1")
+    check("latin-1 解同一响应会乱码（说明为什么不能用 r.text）",
+          ("我誓言" in bad), False)
 
     print("-" * 40)
     if FAILED:
