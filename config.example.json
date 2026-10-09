@@ -20,6 +20,8 @@
     "throttle_sec": 1.5,
     "verify_poll_sec": 180,
     "verify_timeout_hours": 26,
-    "delete_after_verified": true
+    "delete_after_verified": true,
+    "locate_timeout_sec": 300,
+    "locate_interval_sec": 5
   }
 }

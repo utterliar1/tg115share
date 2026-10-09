@@ -55,6 +55,8 @@ DEFAULTS = {
         "verify_timeout_hours": 26,
         "delete_after_verified": True,
         "max_size_tib": 0,
+        "locate_timeout_sec": 300,
+        "locate_interval_sec": 5,
     },
 }
 
@@ -222,6 +224,37 @@ class TG(object):
 # --------------------------------------------------------------------------- #
 # 业务流程
 # --------------------------------------------------------------------------- #
+FID_RE = re.compile(r"^\d{15,20}$")
+
+
+def _candidate_ids(rc):
+    """从 receive_share 返回体里挖出疑似新建项的 file_id。
+
+    不同版本的 115lite 返回字段名不一样（file_id / fid / data.* ...），
+    这里把所有「键名含 id 且值形如 115 file_id」的都收进来做候选。
+    """
+    out = []
+
+    def walk(o):
+        if isinstance(o, dict):
+            for k, v in o.items():
+                if isinstance(v, (str, int)) and FID_RE.match(str(v)) and "id" in k.lower():
+                    out.append(str(v))
+                else:
+                    walk(v)
+        elif isinstance(o, list):
+            for x in o:
+                walk(x)
+
+    walk(rc.get("data"))
+    seen, uniq = set(), []
+    for x in out:
+        if x not in seen:
+            seen.add(x)
+            uniq.append(x)
+    return uniq
+
+
 def account_guard(mcp, cfg):
     """返回 (ok, 描述)。断言 MCP 绑定的是预期账号，避免误操作主号。"""
     acc = mcp.call("get_account_info")
@@ -253,10 +286,13 @@ def do_preview(mcp, share_code, receive_code):
     )
     return {"code": share_code, "pwd": receive_code,
             "title": info.get("share_title") or "",
-            "size": info.get("file_size") or 0}, txt
+            "size": info.get("file_size") or 0,
+            # 分享顶层的条目名 —— 转存后用它兜底匹配新目录
+            "top_names": [it.get("n") or "" for it in (d.get("list") or [])]}, txt
 
 
-def run_pipeline(tg, mcp, cfg, chat_id, share_code, receive_code, reply_msg_id):
+def run_pipeline(tg, mcp, cfg, chat_id, share_code, receive_code, reply_msg_id,
+                 expect_names=None):
     bh = cfg["behavior"]
     throttle = float(bh.get("throttle_sec") or 1.5)
 
@@ -274,29 +310,67 @@ def run_pipeline(tg, mcp, cfg, chat_id, share_code, receive_code, reply_msg_id):
             return
         logging.info("[%s] 账号确认: %s", chat_id, who)
 
-        # 1) 转存前记录根目录，便于定位新落盘目录
-        before = mcp.call("list_files", cid=bh.get("receive_cid") or "0", limit=200, offset=0)
+        # 1) 转存前记录目标目录，便于定位新落盘目录
+        cid = bh.get("receive_cid") or "0"
+        before = mcp.call("list_files", cid=cid, limit=200, offset=0)
         before_ids = {f.get("file_id") for f in ((before.get("data") or {}).get("files") or [])}
 
         status("开始转存…")
-        rc = mcp.call("receive_share", share_code=share_code, receive_code=receive_code,
-                      cid=bh.get("receive_cid") or "0")
+        rc = mcp.call("receive_share", share_code=share_code, receive_code=receive_code, cid=cid)
+        # 转存接口的原始返回必须留档 —— 失败时这是唯一线索
+        logging.info("[%s] receive_share 返回: %s", chat_id,
+                     json.dumps(rc, ensure_ascii=False)[:1500])
+        if rc.get("state") is False:
+            reason = (rc.get("error") or rc.get("errmsg") or rc.get("message")
+                      or json.dumps(rc, ensure_ascii=False)[:300])
+            status("⚠️ 转存被 115 拒绝：%s" % reason)
+            return
         title = ((rc.get("data") or {}).get("receive_title") or "").strip()
         time.sleep(throttle)
 
-        # 2) 定位新目录
-        after = mcp.call("list_files", cid=bh.get("receive_cid") or "0", limit=200, offset=0)
-        files = (after.get("data") or {}).get("files") or []
-        new_items = [f for f in files if f.get("file_id") not in before_ids]
+        # 2) 轮询定位新目录
+        #    几千项 / TB 级分享在 115 侧是异步落盘，目录可能几秒~几分钟后才出现；
+        #    且 receive_share 返回的字段名各版本不一。故多路兜底：
+        #      a) 返回体里给出的 file_id
+        #      b) 名字 == receive_title（若返回里有）
+        #      c) 名字 == 分享顶层条目名（预览时已拿到）
+        #      d) 目标目录里唯一的「新增项」
         fid = None
-        for f in new_items:
-            if title and f.get("name") == title:
-                fid = f.get("file_id")
+        cand_ids = _candidate_ids(rc)
+        timeout = float(bh.get("locate_timeout_sec") or 300)
+        interval = float(bh.get("locate_interval_sec") or 5)
+        deadline = time.time() + timeout
+        last_new = []
+        while True:
+            after = mcp.call("list_files", cid=cid, limit=200, offset=0)
+            files = (after.get("data") or {}).get("files") or []
+            new_items = [f for f in files if f.get("file_id") not in before_ids]
+            last_new = new_items
+            cur_ids = {f.get("file_id") for f in files}
+
+            for c in cand_ids:                       # (a)
+                if c in cur_ids and c not in before_ids:
+                    fid = c
+                    break
+            if not fid:                              # (b)(c)
+                wants = [w for w in ([title] + list(expect_names or [])) if w]
+                for w in wants:
+                    hit = next((f for f in new_items if f.get("name") == w), None)
+                    if hit:
+                        fid = hit.get("file_id")
+                        break
+            if not fid and len(new_items) == 1:      # (d)
+                fid = new_items[0].get("file_id")
+            if fid or time.time() >= deadline:
                 break
-        if not fid and len(new_items) == 1:
-            fid = new_items[0].get("file_id")
+            time.sleep(interval)
+
         if not fid:
-            status("⚠️ 转存完成但没能定位到新目录，请到网盘手动确认。\n标题：%s" % (title or "-"))
+            logging.warning("[%s] 未能定位新目录；候选id=%s 目录末尾新增=%s",
+                            chat_id, cand_ids, [f.get("name") for f in last_new])
+            status("⚠️ 转存未在 %.0f 秒内落盘，请到网盘手动确认。\n"
+                   "转存接口返回：%s"
+                   % (timeout, json.dumps(rc, ensure_ascii=False)[:300]))
             return
         time.sleep(throttle)
 
@@ -456,13 +530,15 @@ def main():
 
                 if parts[0] == "go":
                     _, code, pwd = parts
+                    info = pending.get(chat_id) or {}
                     with lock:
                         if chat_id in busy:
                             tg.send(chat_id, "上一个任务还在跑，请稍候。")
                             continue
                         busy.add(chat_id)
                     threading.Thread(
-                        target=lambda: (run_pipeline(tg, mcp, cfg, chat_id, code, pwd, msg_id),
+                        target=lambda: (run_pipeline(tg, mcp, cfg, chat_id, code, pwd, msg_id,
+                                                     info.get("top_names")),
                                         busy.discard(chat_id)),
                         daemon=True).start()
                     pending.pop(chat_id, None)

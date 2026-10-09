@@ -79,6 +79,17 @@ def main():
     check("latin-1 解同一响应会乱码（说明为什么不能用 r.text）",
           ("我誓言" in bad), False)
 
+    # ---------- _candidate_ids：从 receive_share 返回里挖新目录 file_id ----------
+    rc = {"state": True, "data": {
+        "receive_title": "某剧 (2024)",
+        "file_id": "3535972005968872591",
+        "list": [{"fid": "1111222233334444555", "name": "x"},
+                 {"name": "无关", "note": "not-an-id"}]}}
+    check("_candidate_ids 命中 file_id 与 fid",
+          m._candidate_ids(rc),
+          ["3535972005968872591", "1111222233334444555"])
+    check("_candidate_ids 无返回时为空", m._candidate_ids({}), [])
+
     print("-" * 40)
     if FAILED:
         print("FAILED: %d 项 -> %s" % (len(FAILED), ", ".join(FAILED)))
