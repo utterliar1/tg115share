@@ -1,0 +1,32 @@
+# ============================================================
+# tg115share —— 飞牛 NAS（fnOS）/ 任意 Linux 上的部署编排
+#
+#   docker compose up -d
+#   docker compose logs -f
+#
+# 前置：目录里先放好 config.json（从 config.example.json 复制并填值）。
+# ============================================================
+services:
+  tg115share:
+    image: ghcr.io/utterliar1/tg115share:latest
+    # 想自己构建就注释掉上面一行、启用下面这行：
+    # build: .
+    container_name: tg115share
+    restart: unless-stopped
+
+    # 用 host 网络：容器内的 127.0.0.1 即宿主本体 → 可直接访问同机的
+    # MCP（http://127.0.0.1:11510/mcp-server），config.json 的 mcp.url 无需改动。
+    # 若你的环境不支持 host 网络，改用下面注释里的 bridge + extra_hosts 方案，
+    # 并把 config.json 的 mcp.url 改成 http://host.docker.internal:11510/mcp-server
+    network_mode: host
+    # network_mode 与 ports 互斥，本服务只做长轮询、不对外暴露端口，故无需 ports。
+    #
+    # 备选（bridge）：
+    # extra_hosts:
+    #   - "host.docker.internal:host-gateway"
+
+    volumes:
+      # 配置只读挂载（内含敏感凭据，不要打进镜像）
+      - ./config.json:/app/config.json:ro
+      # 日志持久化：宿主 ./data 需可写（首次部署：mkdir -p data && sudo chown 1000:1000 data）
+      - ./data:/data

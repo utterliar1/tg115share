@@ -1,0 +1,25 @@
+{
+  "telegram": {
+    "bot_token": "填 @BotFather 给你的 token",
+    "allowed_chat_ids": ["填你自己的 TG 用户ID（@userinfobot 可查）"],
+    "proxy": "http://192.168.123.1:7890",
+    "poll_timeout": 50
+  },
+  "mcp": {
+    "url": "http://127.0.0.1:11510/mcp-server",
+    "token": "Bearer 从 ~/.workbuddy/mcp.json 的 Authorization 原样抄过来",
+    "timeout": 60
+  },
+  "account": {
+    "expect_user_id": "9697664",
+    "expect_user_name": "我誓言"
+  },
+  "behavior": {
+    "receive_cid": "0",
+    "share_duration_days": 15,
+    "throttle_sec": 1.5,
+    "verify_poll_sec": 180,
+    "verify_timeout_hours": 26,
+    "delete_after_verified": true
+  }
+}

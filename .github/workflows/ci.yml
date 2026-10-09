@@ -1,0 +1,182 @@
+name: ci
+
+# ============================================================
+# 流水线：验证 → 构建推送 ghcr.io → 冒烟
+#
+#   test   纯离线回归（语法编译 + 链接解析/体积格式化纯函数），不需要网络凭据
+#   build  仅当 test 全绿才构建镜像并推到 ghcr.io（PR 不推）
+#   smoke  把刚推上去的镜像真拉下来起容器，验证能运行、依赖齐、非 root
+#
+# 推 ghcr.io 只用内置 GITHUB_TOKEN（permissions: packages: write），
+# 不需要配置任何 secret。镜像名会被自动转小写。
+# ============================================================
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  # ghcr 要求镜像名全小写
+  IMAGE: ghcr.io/utterliar1/tg115share
+
+# 同一分支连推多次时，取消上一次还没跑完的
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ------------------------------------------------------------
+  # 1. 验证（离线，零依赖网络）
+  # ------------------------------------------------------------
+  test:
+    name: 验证 · 语法 + 纯函数回归
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v7
+
+      - name: 准备 Python 3.12
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+
+      - name: 语法自检
+        run: python -m compileall -q tg115share.py test_smoke.py
+
+      - name: 纯函数回归（链接解析 / 体积格式化）
+        run: python test_smoke.py
+
+  # ------------------------------------------------------------
+  # 2. 构建并推送 ghcr.io（test 绿了才跑，PR 不推）
+  # ------------------------------------------------------------
+  build:
+    name: 构建 · 推送 ghcr.io
+    needs: [test]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      smoke_ref: ${{ steps.shortsha.outputs.ref }}
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v7
+
+      # arm64 由 QEMU 模拟。只想出 amd64 的话删掉本步骤并把 platforms 改回 linux/amd64。
+      - name: 准备 QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: 准备 buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: 登录 ghcr.io
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 生成镜像标签
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
+
+      - name: 记下本次的短 sha 标签
+        id: shortsha
+        run: echo "ref=${IMAGE}:sha-${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+
+      - name: 构建并推送
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          # 双架构：x86_64（飞牛 / 爱快 / 群晖）与 arm64（树莓派 / ARM NAS）
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # 打 tag 时注入 git tag 当版本号；分支构建标记为 dev。
+          build-args: |
+            APP_VERSION=${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 写入构建摘要
+        run: |
+          {
+            echo "### 已推送到 ghcr.io"
+            echo ""
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+            echo ""
+            echo "- 架构：linux/amd64, linux/arm64"
+            echo "- 短 sha：\`${{ steps.shortsha.outputs.ref }}\`"
+            echo "- base：\`python:3.12-slim\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ------------------------------------------------------------
+  # 3. 冒烟：把刚推上去的镜像真跑起来
+  # ------------------------------------------------------------
+  smoke:
+    name: 冒烟 · 真拉真起
+    needs: [build]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 登录 ghcr.io
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 拉取镜像并跑起来
+        run: |
+          set -euo pipefail
+          IMG="${{ needs.build.outputs.smoke_ref }}"
+          echo "被测镜像：$IMG"
+          docker pull "$IMG"
+
+          # (1) --help 能跑通 = python 可执行 + requests 已装好 + 脚本可导入
+          #     （import requests 在文件顶部，若缺依赖这一步就会崩）
+          docker run --rm "$IMG" python tg115share.py --help | grep -q "selftest" \
+            || { echo "::error::镜像内无法运行 tg115share.py --help"; exit 1; }
+          echo "OK: --help 可运行且含 selftest 选项"
+
+          # (2) 无 config.json 时应给出明确报错并以非 0 退出（证明配置校验生效）
+          out=$(docker run --rm "$IMG" 2>&1 || true)
+          echo "$out"
+          grep -q "缺少配置文件" <<< "$out" \
+            || { echo "::error::缺配置时未按预期报错"; exit 1; }
+          echo "OK: 缺配置时正确报错退出"
+
+          # (3) 确认以非 root 运行
+          whoami=$(docker run --rm --entrypoint id "$IMG" -un)
+          echo "容器内用户：$whoami"
+          test "$whoami" = "appuser" \
+            || { echo "::error::容器不是以 appuser 运行"; exit 1; }
+          echo "OK: 非 root 运行"
+
+      - name: 失败时 dump 日志
+        if: failure()
+        run: |
+          docker images ghcr.io/utterliar1/tg115share || true
