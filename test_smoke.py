@@ -121,6 +121,21 @@ def main():
     check("嵌套 data.data 里的 receive_code 能取出",
           m._collect_str_values(sf, "receive_code"), ["dbe8"])
 
+    # ---------- receive_done：转存落盘是否完成（115 异步转存的判据）----------
+    # 关键坑：只等"目录出现"就建分享 → 分享快照残缺（实测 1749 部只落 140 部）。
+    TB = 1024 ** 4
+    target = 6 * TB
+    check("体积未达标 → 未完成",
+          m.receive_done(int(0.5 * TB), target, 0.9, 0, 4), (False, ""))
+    check("体积达标 → 完成",
+          m.receive_done(int(0.95 * TB * 6), target, 0.9, 0, 4)[0], True)
+    check("体积未知但增量连续稳定 → 完成",
+          m.receive_done(3 * TB, 0, 0.9, 4, 4)[0], True)
+    check("体积未知、增量尚未稳定 → 未完成",
+          m.receive_done(3 * TB, 0, 0.9, 3, 4), (False, ""))
+    check("零增量（还没开始落盘）→ 未完成",
+          m.receive_done(0, target, 0.9, 9, 4), (False, ""))
+
     print("-" * 40)
     if FAILED:
         print("FAILED: %d 项 -> %s" % (len(FAILED), ", ".join(FAILED)))

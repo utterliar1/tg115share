@@ -57,6 +57,12 @@ DEFAULTS = {
         "max_size_tib": 0,
         "locate_timeout_sec": 300,
         "locate_interval_sec": 5,
+        # 转存落盘等待：115 对大分享是**异步落盘**（先建目录、再灌内容），
+        # 不等完成就建分享会得到残缺快照。这几个参数控制等待策略。
+        "receive_wait_timeout_sec": 3600,
+        "receive_poll_sec": 20,
+        "receive_size_ratio": 0.9,
+        "receive_stable_rounds": 4,
     },
 }
 
@@ -307,6 +313,80 @@ def account_guard(mcp, cfg):
     return True, "%s(%s)" % (uname, uid)
 
 
+def _used_size(mcp):
+    """取账号已用空间（字节）。读取失败返回 -1（调用方跳过本轮）。"""
+    try:
+        acc = mcp.call("get_account_info")
+        sp = ((acc.get("data") or {}).get("space") or {})
+        return int(sp.get("used_size") or 0)
+    except Exception:
+        return -1
+
+
+def receive_done(delta, target, ratio, stable_rounds, need_rounds):
+    """判断转存是否已落盘完成。返回 (done, reason)。纯函数，便于回归测试。
+
+    delta         本次转存带来的已用空间增量（字节）
+    target        源分享声明的体积（字节，可能为 0/未知）
+    ratio         体积达标阈值比例
+    stable_rounds 已连续多少轮增量不变
+    need_rounds   连续不变多少轮即认为落盘结束
+    """
+    if target and float(target) > 0 and delta >= float(target) * float(ratio):
+        return True, "体积达标"
+    if delta > 0 and stable_rounds >= int(need_rounds):
+        return True, "增量连续 %d 轮稳定" % stable_rounds
+    return False, ""
+
+
+def wait_receive_done(mcp, cfg, status, used_before, target, prefix=""):
+    """等 115 把转存内容**真正落盘完成**（异步）。
+
+    ⚠️ 关键坑：115 的 share/receive 对大批量分享是异步的 —— 先建顶层目录，
+    再把成千上万个文件陆续收进去。脚本原来只等"目录出现"就 share_files，
+    于是分享快照只固定了当时已落盘的部分（实测 1749 部只落了 140 部，
+    分享 file_size 仅 451GB）。这里以「已用空间增量」为判据：
+      a) 增量达到源体积的 ratio 倍，或
+      b) 增量连续 need_rounds 轮不变（源体积未知时的兜底）
+    超时则**主动中止、不建分享**（宁可不做，也不要建出残缺分享）。
+    """
+    bh = cfg["behavior"]
+    timeout = float(bh.get("receive_wait_timeout_sec") or 3600)
+    poll = float(bh.get("receive_poll_sec") or 20)
+    ratio = float(bh.get("receive_size_ratio") or 0.9)
+    need = int(bh.get("receive_stable_rounds") or 4)
+    deadline = time.time() + timeout
+    stable, last = 0, None
+    while True:
+        used = _used_size(mcp)
+        if used < 0:
+            if time.time() >= deadline:
+                status("⚠️ 等待转存落盘时读不到账号空间，已中止（未建分享）。")
+                return False
+            time.sleep(poll)
+            continue
+        delta = max(0, used - used_before)
+        if last is not None and delta == last:
+            stable += 1
+        else:
+            stable = 0
+        last = delta
+        done, why = receive_done(delta, target, ratio, stable, need)
+        got = fmt_size(delta)
+        want = fmt_size(target) if target else "未知"
+        if done:
+            logging.info("%s转存落盘完成（%s）：已入库 %s / 源 %s", prefix, why, got, want)
+            return True
+        if time.time() >= deadline:
+            status("⚠️ 等待转存落盘超时（%.0f 分钟），为避免建出**残缺分享**已中止。\n"
+                   "已入库约 %s / 源 %s。\n请稍后重发链接，或到网盘确认落盘进度。"
+                   % (timeout / 60.0, got, want))
+            logging.warning("%s转存等待超时：已入库 %s / 源 %s", prefix, got, want)
+            return False
+        status("⏳ 转存落盘中…已入库 %s / 源 %s" % (got, want))
+        time.sleep(poll)
+
+
 def do_preview(mcp, share_code, receive_code):
     # limit 取满：顶层条目的 file_id 要**全部**拿到，转存时必须带上（见 run_pipeline）
     p = mcp.call("preview_share", share_code=share_code, receive_code=receive_code,
@@ -363,6 +443,8 @@ def run_pipeline(tg, mcp, cfg, chat_id, share_code, receive_code, reply_msg_id,
         cid = bh.get("receive_cid") or "0"
         before = mcp.call("list_files", cid=cid, limit=200, offset=0)
         before_ids = {f.get("file_id") for f in ((before.get("data") or {}).get("files") or [])}
+        # 转存前的已用空间 —— 用于判断 115 何时把内容真正灌完（见 wait_receive_done）
+        used_before = _used_size(mcp)
 
         status("开始转存…")
         # 115 的 share/receive 要求**显式给出要转存的条目 id**：不传 file_id 时
@@ -435,8 +517,14 @@ def run_pipeline(tg, mcp, cfg, chat_id, share_code, receive_code, reply_msg_id,
             return
         time.sleep(throttle)
 
+        # 2.5) 等转存内容真正落盘完成 —— 绝不能"看见目录就建分享"。
+        #      115 对大分享是异步落盘，否则分享快照会残缺（实测 1749 部只落 140）。
+        if not wait_receive_done(mcp, cfg, status, used_before, expect_size,
+                                 prefix="[%s] " % chat_id):
+            return
+
         # 3) 建分享（v1：15 天）
-        status("转存完成，正在创建分享…")
+        status("转存落盘完成，正在创建分享…")
         kwargs = {"file_ids": [fid]}
         if bh.get("share_duration_days"):
             kwargs["share_duration"] = int(bh["share_duration_days"])
@@ -457,6 +545,25 @@ def run_pipeline(tg, mcp, cfg, chat_id, share_code, receive_code, reply_msg_id,
             err = sh.get("error") or sh.get("errmsg") or sh.get("message")
             status("⚠️ 创建分享失败：%s"
                    % (err or json.dumps(sh, ensure_ascii=False)[:300]))
+            return
+
+        # 3.5) 分享完整性自检：新分享快照的体积应接近源体积，防止**再次**建出残缺分享
+        snap_size = 0
+        try:
+            time.sleep(throttle)
+            p2 = mcp.call("preview_share", share_code=new_code, receive_code=new_pwd,
+                          cid="0", limit=1, offset=0)
+            snap_size = ((p2.get("data") or {}).get("shareinfo") or {}).get("file_size") or 0
+        except Exception:
+            logging.warning("分享完整性自检失败", exc_info=True)
+        if (expect_size and snap_size
+                and snap_size < float(expect_size) * float(bh.get("receive_size_ratio") or 0.9)):
+            status("⚠️ 分享已创建，但体积明显偏小、**可能不完整**：\n"
+                   "分享 %s / 源 %s\n\n%s\n提取码：%s\n\n"
+                   "小号副本已保留未删除。建议重新转存后再建一次。"
+                   % (fmt_size(snap_size), fmt_size(expect_size), url, new_pwd))
+            logging.warning("[%s] 分享体积偏小：snapshot=%s source=%s",
+                            chat_id, snap_size, expect_size)
             return
 
         status("✅ 分享已创建（平台审核中）\n\n%s\n提取码：%s\n\n"

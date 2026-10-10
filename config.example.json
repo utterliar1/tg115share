@@ -22,6 +22,10 @@
     "verify_timeout_hours": 26,
     "delete_after_verified": true,
     "locate_timeout_sec": 300,
-    "locate_interval_sec": 5
+    "locate_interval_sec": 5,
+    "receive_wait_timeout_sec": 3600,
+    "receive_poll_sec": 20,
+    "receive_size_ratio": 0.9,
+    "receive_stable_rounds": 4
   }
 }
